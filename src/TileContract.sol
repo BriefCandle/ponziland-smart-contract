@@ -31,33 +31,40 @@ contract TileContract {
   }
 
   // TODO: figure out how to inject proceeds back into the ponzi scheme
-  // so that earlier purchaser can have exit
+  // so that earlier purchaser can exit
+
+  // purchase tile that is owned by someone else
   function purchase(uint64 _tileId, uint256 _price, uint256 amount) external onlyOwned(_tileId) {
     _purchase(_tileId, _price, amount);
   }
 
+  // spawn by setting new tile info & transferring staked amount from caller to contract
   function spawn(uint64 _tileId, uint256 _price, uint256 _amount, address _erc20) external payable onlySpawnable(_tileId) {
     require(whitelist[_erc20], "Tile: erc20 not whitelisted");
     require(SPAWN_PRICE <= msg.value, "Tile: insufficient spawn price");
     _spawn(_tileId, _price, _amount, _erc20);
   }
 
+  // set new price for the tile player owns
   function setPrice(uint64 _tileId, uint256 _price) external onlyOwner(_tileId) {
     _setPrice(_tileId, _price);
   }
 
+  // stake more erc20 tokens to the tile player owns
   function stake(uint64 _tileId, uint256 _amount) external onlyOwner(_tileId) {
     _stake(_tileId, _amount);
   }
 
+  // collect taxes from all neighbors' tiles based on their tile's price
   function collectTaxes(uint64 _tileId) external onlyOwner(_tileId) {
     _collectTaxes(_tileId);
   }
 
+  // liquidate tile when it has insufficient balance to pay taxes to all neighbors
   function liquidateTile(uint64 _tileId) external onlyOwned(_tileId) {
     require(canLiquidate(_tileId), "Tile: cannot liquidate");
 
-    _liquidateTile(msg.sender, _tileId);
+    _clearTile(msg.sender, _tileId);
   }
 
   modifier onlyOwner(uint64 _tileId) {
@@ -76,27 +83,37 @@ contract TileContract {
     _;
   }
 
+  /**
+   * purchase by 1) clear tile, 2) spawn new tile, and 3) transfer old price to previous owner
+   */
   function _purchase(uint64 _tileId, uint256 _price, uint256 _amount) internal {
     Tile memory tile = tiles[_tileId];
-    require(_price >= tile.price , "Tile: insufficient purchase price");
     
-    _liquidateTile(tile.owner, _tileId);
+    _clearTile(tile.owner, _tileId);
     _spawn(_tileId, _price, _amount, tile.erc20);
+    IERC20(tile.erc20).transferFrom(msg.sender, tile.owner, tile.price);
   }
 
-  // spawn by setting new tile info & transferring staked amount from caller to contract
+  /**
+   * spawn by setting up new tile info & transferring staked amount from caller to contract
+   */
   function _spawn(uint64 _tileId, uint256 _price, uint256 _amount, address _erc20) internal {
     tiles[_tileId] = Tile(msg.sender, _price, _amount, _erc20, uint40(block.timestamp));
     IERC20(_erc20).transferFrom(msg.sender, address(this), _amount);
   }
 
+  /**
+   * stake more erc20 tokens by transferring erc20 & updating the balance
+   */
   function _stake(uint64 _tileId, uint256 _amount) public {
     tiles[_tileId].balance += _amount;
     IERC20(tiles[_tileId].erc20).transferFrom(msg.sender, address(this), _amount);
   }
 
-  // collect taxes from all your neighbors' tiles based on their tile's price;
-  // liquidate neighbor's tile if they don't have enough balance to pay taxes
+  /**
+   * collect taxes from all neighbours' tiles based on their tile's price. If neighour has insufficient 
+   * balance to pay taxes, transfer what remained to caller and delete tile
+   */
   function _collectTaxes(uint64 _tileId) internal {
     uint64[8] memory nearTiles = TileLibrary.getNearTiles(_tileId);    
     uint40 lastUpdated = tiles[_tileId].lastUpdated;
@@ -109,17 +126,22 @@ contract TileContract {
       
       uint256 amountToCollect = getTaxAmount(nearTile.price, lastUpdated);
       if(amountToCollect >= nearTile.balance) {
-        _liquidateTile(msg.sender, nearTileID);
+        delete tiles[nearTileID];
+        IERC20(nearTile.erc20).transfer(msg.sender, nearTile.balance);
       } else {
         tiles[nearTileID].balance -= amountToCollect;
-        IERC20(nearTile.erc20).transfer(tiles[_tileId].owner, amountToCollect);
+        IERC20(nearTile.erc20).transfer(msg.sender, amountToCollect);
       }
     }
   }
 
-  // liquidate tile by 1) remove tile, 2) pay taxes owed to all neighbours, and 3) 
-  // send remained to the liquidator, if there is any left
-  function _liquidateTile(address _liquidator, uint64 _tileId) internal {
+  /**
+   * clear tile by 1) remove tile, 2) pay taxes owed to all neighbours, and 3) 
+   * send remained to the liquidator, if there is any left
+   * clearTile() should be understood is a function to clear all currently owed tax 
+   * obligations, rendering the title free and clear for anyone to spawn
+   */
+  function _clearTile(address _liquidator, uint64 _tileId) internal {
     Tile memory tile = tiles[_tileId];
     delete tiles[_tileId];
     uint256 remained = _payTaxes(_tileId, tile);
@@ -129,7 +151,10 @@ contract TileContract {
     }
   }
 
-  // set new price, and then pay tax arrears to all neighbours
+  /**
+   * set new price, and then pay tax arrears to all neighbours. If remained becomes 0, cannot
+   * set new price. It is more likely liquidation will happen before this happens
+   */
   function _setPrice(uint64 _tileId, uint256 _price) internal {
     Tile memory tile = tiles[_tileId];
     tiles[_tileId].price = _price;
@@ -141,6 +166,9 @@ contract TileContract {
     }
   }
 
+  /**
+   * pay taxes to all neighbours; if remained cannot cover taxes, return 0
+   */
   function _payTaxes(uint64 _tileId, Tile memory tile) private returns (uint256 remained) {
     uint64[8] memory nearTiles = TileLibrary.getNearTiles(_tileId);
 
@@ -152,9 +180,8 @@ contract TileContract {
       
       uint256 amountToPay = getTaxAmount(tile.price, tiles[nearTileID].lastUpdated);
       if(amountToPay >= remained) {
-        remained = 0;
         IERC20(tile.erc20).transfer(tiles[nearTileID].owner, remained);
-        return remained;
+        return 0;
       }
       IERC20(tile.erc20).transfer(tiles[nearTileID].owner, amountToPay);
 
